@@ -5,9 +5,11 @@ diff -Naur src/http/ngx_http_upstream.h src-hash/http/ngx_http_upstream.h
  
      ngx_array_t                     *servers;  /* ngx_http_upstream_server_t */
  
++#if (NGX_HTTP_UPSTREAM_HASH) 
 +    ngx_array_t                     *values;
 +    ngx_array_t                     *lengths;
 +    ngx_uint_t                       retries;
++#endif
 +
      ngx_uint_t                       flags;
      ngx_str_t                        host;
