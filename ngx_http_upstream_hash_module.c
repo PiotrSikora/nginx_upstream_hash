@@ -10,6 +10,9 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#if (NGX_HTTP_HEALTHCHECK)
+#include <ngx_http_healthcheck_module.h>
+#endif
 
 #define ngx_bitvector_index(index) (index / (8 * sizeof(uintptr_t)))
 #define ngx_bitvector_bit(index) ((uintptr_t) 1 << (index % (8 * sizeof(uintptr_t))))
@@ -19,6 +22,9 @@ typedef struct {
     socklen_t                       socklen;
     ngx_str_t                       name;
     unsigned                        down:1;
+#if (NGX_HTTP_HEALTHCHECK)
+    ngx_int_t                       health_index;
+#endif
 } ngx_http_upstream_hash_peer_t;
 
 typedef struct {
@@ -51,7 +57,7 @@ static char *ngx_http_upstream_hash_again(ngx_conf_t *cf, ngx_command_t *cmd,
 static ngx_int_t ngx_http_upstream_init_hash(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us);
 static ngx_uint_t ngx_http_upstream_hash_crc32(u_char *keydata, size_t keylen);
-
+static ngx_int_t ngx_http_upstream_is_down(ngx_http_upstream_hash_peer_t *peer);
 
 static ngx_command_t  ngx_http_upstream_hash_commands[] = {
     { ngx_string("hash"),
@@ -109,6 +115,9 @@ ngx_http_upstream_init_hash(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     ngx_uint_t                       i, j, n;
     ngx_http_upstream_server_t      *server;
     ngx_http_upstream_hash_peers_t  *peers;
+#if (NGX_HTTP_HEALTHCHECK)
+    ngx_int_t                        health_index;
+#endif
 
     us->peer.init = ngx_http_upstream_init_hash_peer;
 
@@ -139,6 +148,17 @@ ngx_http_upstream_init_hash(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
             peers->peer[n].socklen = server[i].addrs[j].socklen;
             peers->peer[n].name = server[i].addrs[j].name;
             peers->peer[n].down = server[i].down;
+#if (NGX_HTTP_HEALTHCHECK)
+            if (!server[i].down) {
+                health_index =
+                    ngx_http_healthcheck_add_peer(us,
+                    &server[i].addrs[j], cf->pool);
+                if (health_index == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+                peers->peer[n].health_index = health_index;
+            }
+#endif
         }
     }
 
@@ -264,7 +284,15 @@ static void ngx_http_upstream_hash_next_peer(ngx_http_upstream_hash_peer_data_t 
        // the current peer isn't marked down
    } while (--(*tries) && (
        (uhpd->tried[ngx_bitvector_index(current)] & ngx_bitvector_bit(current))
-        || uhpd->peers->peer[current].down));
+        || ngx_http_upstream_is_down(&uhpd->peers->peer[current])));
+}
+
+static ngx_int_t ngx_http_upstream_is_down(ngx_http_upstream_hash_peer_t *peer) {
+  return peer->down
+#if (NGX_HTTP_HEALTHCHECK)
+    || ngx_http_healthcheck_is_down(peer->health_index)
+#endif
+    ;
 }
 
 /* bit-shift, bit-mask, and non-zero requirement are for libmemcache compatibility */
