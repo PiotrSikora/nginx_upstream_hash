@@ -57,7 +57,8 @@ static char *ngx_http_upstream_hash_again(ngx_conf_t *cf, ngx_command_t *cmd,
 static ngx_int_t ngx_http_upstream_init_hash(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us);
 static ngx_uint_t ngx_http_upstream_hash_crc32(u_char *keydata, size_t keylen);
-static ngx_int_t ngx_http_upstream_is_down(ngx_http_upstream_hash_peer_t *peer);
+static ngx_int_t ngx_http_upstream_is_down(ngx_http_upstream_hash_peer_t *peer,
+    ngx_log_t *log);
 
 static ngx_command_t  ngx_http_upstream_hash_commands[] = {
     { ngx_string("hash"),
@@ -284,13 +285,14 @@ static void ngx_http_upstream_hash_next_peer(ngx_http_upstream_hash_peer_data_t 
        // the current peer isn't marked down
    } while (--(*tries) && (
        (uhpd->tried[ngx_bitvector_index(current)] & ngx_bitvector_bit(current))
-        || ngx_http_upstream_is_down(&uhpd->peers->peer[current])));
+        || ngx_http_upstream_is_down(&uhpd->peers->peer[current], log)));
 }
 
-static ngx_int_t ngx_http_upstream_is_down(ngx_http_upstream_hash_peer_t *peer) {
+static ngx_int_t ngx_http_upstream_is_down(ngx_http_upstream_hash_peer_t *peer,
+    ngx_log_t *log) {
   return peer->down
 #if (NGX_HTTP_HEALTHCHECK)
-    || ngx_http_healthcheck_is_down(peer->health_index)
+    || ngx_http_healthcheck_is_down(peer->health_index, log)
 #endif
     ;
 }
