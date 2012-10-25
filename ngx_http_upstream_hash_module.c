@@ -19,6 +19,10 @@
 #define ngx_bitvector_bit(index) ((uintptr_t) 1 << (index % (8 * sizeof(uintptr_t))))
 
 typedef struct {
+    ngx_http_complex_value_t       *ignore_weights;
+} ngx_http_upstream_hash_srv_conf_t;
+
+typedef struct {
     struct sockaddr                *sockaddr;
     socklen_t                       socklen;
     ngx_str_t                       name;
@@ -46,6 +50,7 @@ typedef struct {
     ngx_str_t                         original_key;
     ngx_uint_t                        try_i;
     uintptr_t                         tried[1];
+    unsigned                          ignore_weights:1;
 } ngx_http_upstream_hash_peer_data_t;
 
 
@@ -65,6 +70,7 @@ static ngx_int_t ngx_http_upstream_set_hash_peer_session(ngx_peer_connection_t *
 static void ngx_http_upstream_save_hash_peer_session(ngx_peer_connection_t *pc,
     void *data);
 #endif
+static void * ngx_http_upstream_hash_create_conf(ngx_conf_t *cf);
 static char *ngx_http_upstream_hash(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_upstream_hash_again(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -75,7 +81,7 @@ static ngx_uint_t ngx_http_upstream_hash_crc32(u_char *keydata, size_t keylen);
 
 static ngx_command_t  ngx_http_upstream_hash_commands[] = {
     { ngx_string("hash"),
-      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE12,
       ngx_http_upstream_hash,
       0,
       0,
@@ -99,7 +105,7 @@ static ngx_http_module_t  ngx_http_upstream_hash_module_ctx = {
     NULL,                                  /* create main configuration */
     NULL,                                  /* init main configuration */
 
-    NULL,                                  /* create server configuration */
+    ngx_http_upstream_hash_create_conf,    /* create server configuration */
     NULL,                                  /* merge server configuration */
 
     NULL,                                  /* create location configuration */
@@ -129,7 +135,7 @@ ngx_http_upstream_get_hash_peer_index(ngx_http_upstream_hash_peer_data_t *uhpd)
     ngx_int_t   w;
     ngx_uint_t  i;
 
-    if (!uhpd->peers->weighted) {
+    if (uhpd->ignore_weights || !uhpd->peers->weighted) {
         return uhpd->hash % uhpd->peers->number;
     }
 
@@ -226,9 +232,9 @@ static ngx_int_t
 ngx_http_upstream_init_hash_peer(ngx_http_request_t *r,
     ngx_http_upstream_srv_conf_t *us)
 {
-    ngx_http_upstream_hash_peer_data_t     *uhpd;
-
-    ngx_str_t val;
+    ngx_http_upstream_hash_srv_conf_t   *uhcf;
+    ngx_http_upstream_hash_peer_data_t  *uhpd;
+    ngx_str_t                            val, s;
 
     if (ngx_http_script_run(r, &val, us->lengths, 0, us->values) == NULL) {
         return NGX_ERROR;
@@ -240,6 +246,18 @@ ngx_http_upstream_init_hash_peer(ngx_http_request_t *r,
                     (8 * sizeof(uintptr_t)));
     if (uhpd == NULL) {
         return NGX_ERROR;
+    }
+
+    uhcf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_hash_module);
+
+    if (uhcf->ignore_weights) {
+        if (ngx_http_complex_value(r, uhcf->ignore_weights, &s) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        if (s.len == 2 && ngx_strncmp(s.data, "on", 2) == 0) {
+            uhpd->ignore_weights = 1;
+        }
     }
 
     r->upstream->peer.data = uhpd;
@@ -439,13 +457,37 @@ ngx_http_upstream_hash_crc32(u_char *keydata, size_t keylen)
     return crc32 ? crc32 : 1;
 }
 
+
+static void *
+ngx_http_upstream_hash_create_conf(ngx_conf_t *cf)
+{
+    ngx_http_upstream_hash_srv_conf_t  *conf;
+
+    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_hash_srv_conf_t));
+    if (conf == NULL) {
+        return NULL;
+    }
+
+    /*
+     * set by ngx_pcalloc():
+     *
+     *     conf->ignore_weights = NULL;
+     */
+
+    return conf;
+}
+
+
 static char *
 ngx_http_upstream_hash(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_http_upstream_srv_conf_t  *uscf;
-    ngx_http_script_compile_t      sc;
-    ngx_str_t                     *value;
-    ngx_array_t                   *vars_lengths, *vars_values;
+    ngx_http_upstream_hash_srv_conf_t  *uhcf;
+    ngx_http_upstream_srv_conf_t       *uscf;
+    ngx_http_script_compile_t           sc;
+    ngx_http_compile_complex_value_t    ccv;
+    ngx_str_t                          *value, s;
+    ngx_array_t                        *vars_lengths, *vars_values;
+    ngx_uint_t                          i;
 
     value = cf->args->elts;
 
@@ -466,6 +508,40 @@ ngx_http_upstream_hash(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
+    uhcf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_hash_module);
+
+    for (i = 2; i < cf->args->nelts; i++) {
+
+        if (ngx_strncmp(value[i].data, "ignore_weights=", 15) == 0) {
+
+            s.len = value[i].len - 15;
+            s.data = &value[i].data[15];
+
+            if (uhcf->ignore_weights != NULL) {
+                return "is duplicate";
+            }
+
+            uhcf->ignore_weights = ngx_palloc(cf->pool,
+                                              sizeof(ngx_http_complex_value_t));
+            if (uhcf->ignore_weights == NULL) {
+                return NGX_CONF_ERROR;
+            }
+
+            ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+            ccv.cf = cf;
+            ccv.value = &s;
+            ccv.complex_value = uhcf->ignore_weights;
+
+            if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        goto invalid;
+    }
 
     uscf->peer.init_upstream = ngx_http_upstream_init_hash;
 
@@ -477,6 +553,13 @@ ngx_http_upstream_hash(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     uscf->lengths = vars_lengths->elts;
 
     return NGX_CONF_OK;
+
+invalid:
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "invalid parameter \"%V\"", &value[i]);
+
+    return NGX_CONF_ERROR;
 }
 
 static char *
