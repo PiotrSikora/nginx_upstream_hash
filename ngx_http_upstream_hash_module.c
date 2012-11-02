@@ -22,6 +22,7 @@ typedef struct {
     socklen_t                       socklen;
     ngx_str_t                       name;
     unsigned                        down:1;
+    ngx_int_t                       weight;
 #if (NGX_HTTP_HEALTHCHECK)
     ngx_int_t                       health_index;
 #endif
@@ -29,6 +30,8 @@ typedef struct {
 
 typedef struct {
     ngx_uint_t                        number;
+    ngx_uint_t                        total_weight;
+    unsigned                          weighted:1;
     ngx_http_upstream_hash_peer_t     peer[0];
 } ngx_http_upstream_hash_peers_t;
 
@@ -42,6 +45,8 @@ typedef struct {
 } ngx_http_upstream_hash_peer_data_t;
 
 
+static ngx_uint_t ngx_http_upstream_get_hash_peer_index(
+    ngx_http_upstream_hash_peer_data_t *uhpd);
 static void ngx_http_upstream_hash_next_peer(ngx_http_upstream_hash_peer_data_t *uhpd,
         ngx_uint_t *tries, ngx_log_t *log);
 static ngx_int_t ngx_http_upstream_init_hash_peer(ngx_http_request_t *r,
@@ -110,10 +115,35 @@ ngx_module_t  ngx_http_upstream_hash_module = {
 };
 
 
+static ngx_uint_t
+ngx_http_upstream_get_hash_peer_index(ngx_http_upstream_hash_peer_data_t *uhpd)
+{
+    ngx_int_t   w;
+    ngx_uint_t  i;
+
+    if (!uhpd->peers->weighted) {
+        return uhpd->hash % uhpd->peers->number;
+    }
+
+    w = uhpd->hash % uhpd->peers->total_weight;
+
+    for (i = 0; i < uhpd->peers->number; i++) {
+        w -= uhpd->peers->peer[i].weight;
+        if (w < 0) {
+            return i;
+        }
+    }
+
+    /* unreachable */
+
+    return 0;
+}
+
+
 static ngx_int_t
 ngx_http_upstream_init_hash(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 {
-    ngx_uint_t                       i, j, n;
+    ngx_uint_t                       i, j, n, w;
     ngx_http_upstream_server_t      *server;
     ngx_http_upstream_hash_peers_t  *peers;
 #if (NGX_HTTP_HEALTHCHECK)
@@ -129,8 +159,9 @@ ngx_http_upstream_init_hash(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
 
     server = us->servers->elts;
 
-    for (n = 0, i = 0; i < us->servers->nelts; i++) {
+    for (n = 0, w = 0, i = 0; i < us->servers->nelts; i++) {
         n += server[i].naddrs;
+        w += server[i].naddrs * server[i].weight;
     }
 
     peers = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_hash_peers_t)
@@ -141,6 +172,8 @@ ngx_http_upstream_init_hash(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
     }
 
     peers->number = n;
+    peers->weighted = (w != n);
+    peers->total_weight = w;
 
     /* one hostname can have multiple IP addresses in DNS */
     for (n = 0, i = 0; i < us->servers->nelts; i++) {
@@ -149,6 +182,7 @@ ngx_http_upstream_init_hash(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us)
             peers->peer[n].socklen = server[i].addrs[j].socklen;
             peers->peer[n].name = server[i].addrs[j].name;
             peers->peer[n].down = server[i].down;
+            peers->peer[n].weight = server[i].weight;
 #if (NGX_HTTP_HEALTHCHECK)
             if (!server[i].down) {
                 health_index =
@@ -209,7 +243,7 @@ ngx_http_upstream_init_hash_peer(ngx_http_request_t *r,
 
     ngx_http_upstream_hash_next_peer(uhpd, &r->upstream->peer.tries, r->connection->log);
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "upstream_hash: Starting with %ui", uhpd->hash % uhpd->peers->number);
+                   "upstream_hash: Starting with %ui", ngx_http_upstream_get_hash_peer_index(uhpd));
 
 
     return NGX_OK;
@@ -229,7 +263,7 @@ ngx_http_upstream_get_hash_peer(ngx_peer_connection_t *pc, void *data)
     pc->cached = 0;
     pc->connection = NULL;
 
-    peer_index = uhpd->hash % uhpd->peers->number;
+    peer_index = ngx_http_upstream_get_hash_peer_index(uhpd);
 
     peer = &uhpd->peers->peer[peer_index];
 
@@ -257,12 +291,12 @@ ngx_http_upstream_free_hash_peer(ngx_peer_connection_t *pc, void *data,
 
     if (state & (NGX_PEER_FAILED|NGX_PEER_NEXT)
             && pc->tries) {
-        current = uhpd->hash % uhpd->peers->number;
+        current = ngx_http_upstream_get_hash_peer_index(uhpd);
 
         uhpd->tried[ngx_bitvector_index(current)] |= ngx_bitvector_bit(current);
         ngx_http_upstream_hash_next_peer(uhpd, &pc->tries, pc->log);
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-          "upstream_hash: Using %ui because %ui failed", uhpd->hash % uhpd->peers->number, current);
+          "upstream_hash: Using %ui because %ui failed", ngx_http_upstream_get_hash_peer_index(uhpd), current);
     } else {
         pc->tries = 0;
     }
@@ -272,13 +306,13 @@ static void ngx_http_upstream_hash_next_peer(ngx_http_upstream_hash_peer_data_t 
         ngx_uint_t *tries, ngx_log_t *log) {
 
     ngx_uint_t current;
-    current = uhpd->hash % uhpd->peers->number;
+    current = ngx_http_upstream_get_hash_peer_index(uhpd);
     do {
        uhpd->current_key.len = ngx_sprintf(uhpd->current_key.data, "%d%V",
            ++uhpd->try_i, &uhpd->original_key) - uhpd->current_key.data;
        uhpd->hash += ngx_http_upstream_hash_crc32(uhpd->current_key.data,
            uhpd->current_key.len);
-       current = uhpd->hash % uhpd->peers->number;
+       current = ngx_http_upstream_get_hash_peer_index(uhpd);
        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
            "upstream_hash: hashed \"%V\" to %ui", &uhpd->current_key, current);
        //   Loop while there is a try left, we're on one we haven't tried, and
@@ -335,7 +369,9 @@ ngx_http_upstream_hash(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     uscf->peer.init_upstream = ngx_http_upstream_init_hash;
 
-    uscf->flags = NGX_HTTP_UPSTREAM_CREATE | NGX_HTTP_UPSTREAM_DOWN;
+    uscf->flags = NGX_HTTP_UPSTREAM_CREATE
+                  |NGX_HTTP_UPSTREAM_WEIGHT
+                  |NGX_HTTP_UPSTREAM_DOWN;
 
     uscf->values = vars_values->elts;
     uscf->lengths = vars_lengths->elts;
